@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Rhistory
+.RData
+.Rproj.user/
+.vscode/
+.idea/
+.env
+Thumbs.db
+.DS_Store
+# Raw dataset: verify redistribution rights before committing.
+/diabetes.csv

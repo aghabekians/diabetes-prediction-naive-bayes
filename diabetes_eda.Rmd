@@ -1,0 +1,244 @@
+---
+title: "Diabetes prediction with Naive Bayes: exploratory analysis of the variables"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 8, fig.height = 5, out.width = "95%")
+library(ggplot2)
+theme_set(theme_minimal(base_size = 11))
+col_y <- c("No diabetes" = "#4575b4", "Diabetes" = "#d73027")
+```
+
+# Dataset and variables
+
+The data is the Pima Indians Diabetes dataset (768 women, `diabetes.csv`). Each row is one patient; the goal is to predict `Outcome` (diabetes: 1 = yes, 0 = no) from 8 medical predictors.
+
+| Variable | Meaning |
+|---|---|
+| `Pregnancies` | Number of pregnancies |
+| `Glucose` | Plasma glucose concentration (2-hour oral glucose tolerance test) |
+| `BloodPressure` | Diastolic blood pressure (mm Hg) |
+| `SkinThickness` | Triceps skinfold thickness (mm) |
+| `Insulin` | 2-hour serum insulin (mu U/ml) |
+| `BMI` | Body mass index (kg/m²) |
+| `DiabetesPedigreeFunction` | Score of diabetes family history |
+| `Age` | Age (years) |
+| `Outcome` | **Response:** diabetes yes/no |
+
+# Data preparation
+
+```{r prep}
+diab <- read.csv("diabetes.csv")
+str(diab)
+
+diab$Outcome <- factor(diab$Outcome, levels = c(0, 1), labels = c("No diabetes", "Diabetes"))
+predictors <- names(diab)[1:8]
+
+# Zero is impossible for these variables -> it is a disguised missing value
+zero_vars <- c("Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI")
+cat("Zeros in each variable:\n"); print(colSums(diab[predictors] == 0))
+
+for (v in zero_vars) diab[[v]][diab[[v]] == 0] <- NA
+miss <- data.frame(Variable = predictors,
+                   Missing = colSums(is.na(diab[predictors])),
+                   Percent = round(100 * colMeans(is.na(diab[predictors])), 1))
+rownames(miss) <- NULL
+knitr::kable(miss[miss$Missing > 0, ], caption = "Variables with hidden missing values (zeros replaced by NA)")
+```
+
+**Decision.** A glucose, blood pressure, skinfold, insulin or BMI of 0 is physiologically impossible, so these zeros are treated as missing (`NA`) in the analysis. `Pregnancies = 0` is valid and is kept. No rows are deleted; every statistic below uses the available values of each variable. `Insulin` (`r miss$Percent[miss$Variable == "Insulin"]`%) and `SkinThickness` (`r miss$Percent[miss$Variable == "SkinThickness"]`%) have a very large share of missing values, which matters for the choice of variables (see the conclusions). If the zeros were left as they are, they would pull the means down and distort the Gaussian densities that Naive Bayes estimates.
+
+```{r helpers}
+skewness <- function(x) { x <- x[!is.na(x)]; mean((x - mean(x))^3) / sd(x)^3 }
+
+get_stats <- function(x) {
+  x <- x[!is.na(x)]
+  c(N = length(x), Mean = mean(x), Median = median(x), SD = sd(x),
+    Min = min(x), Q1 = unname(quantile(x, .25)), Q3 = unname(quantile(x, .75)),
+    Max = max(x), Skewness = skewness(x))
+}
+
+# long format for faceted plots
+long <- do.call(rbind, lapply(predictors, function(v)
+  data.frame(Variable = v, Value = diab[[v]], Outcome = diab$Outcome)))
+long$Variable <- factor(long$Variable, levels = predictors)
+long <- long[!is.na(long$Value), ]
+```
+
+# Response variable
+
+```{r response}
+tb <- table(diab$Outcome)
+knitr::kable(data.frame(Class = names(tb), Count = as.integer(tb),
+                        Percent = round(100 * prop.table(tb), 1)),
+             caption = "Distribution of Outcome")
+
+ggplot(diab, aes(x = Outcome, fill = Outcome)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  scale_fill_manual(values = col_y) +
+  labs(title = "Number of patients by diabetes status", x = NULL, y = "Patients")
+```
+
+`r round(100 * mean(diab$Outcome == "Diabetes"), 1)`% of the patients have diabetes, so the classes are moderately imbalanced. For Naive Bayes this matters because the **prior probability** P(diabetes) equals this share. A classifier that always answers "no diabetes" would already be about `r round(100 * mean(diab$Outcome == "No diabetes"))`% accurate, so accuracy alone is not a good measure; sensitivity and specificity should also be reported.
+
+# Descriptive statistics of the predictors
+
+```{r desc}
+desc <- t(sapply(predictors, function(v) get_stats(diab[[v]])))
+knitr::kable(round(desc, 2), caption = "Descriptive statistics (missing values excluded)")
+
+ggplot(long, aes(x = Value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "lightblue", colour = "white") +
+  geom_density(linewidth = 0.8) +
+  facet_wrap(~ Variable, scales = "free", ncol = 4) +
+  labs(title = "Distributions of the predictors", x = NULL, y = "Density")
+```
+
+`Glucose` and `BloodPressure` are close to symmetric (mean ≈ median, low skewness) and `BMI` is only mildly right-skewed. `Pregnancies`, `Age`, `DiabetesPedigreeFunction` and especially `Insulin` are strongly right-skewed (long tail of large values, mean clearly above the median), so for them the median and IQR describe the typical patient better than the mean.
+
+# Why these variables? Predictors by diabetes status
+
+A variable is useful for Naive Bayes if its distribution is **different** in the two classes. The table measures this by the difference of group means in standard deviations (Cohen's d, larger |d| = better separation) and by the Wilcoxon rank-sum test.
+
+```{r by-class}
+eff <- do.call(rbind, lapply(predictors, function(v) {
+  a <- diab[[v]][diab$Outcome == "No diabetes"]; a <- a[!is.na(a)]
+  b <- diab[[v]][diab$Outcome == "Diabetes"];    b <- b[!is.na(b)]
+  sp <- sqrt(((length(a) - 1) * var(a) + (length(b) - 1) * var(b)) / (length(a) + length(b) - 2))
+  data.frame(Variable = v,
+             `Mean (no diabetes)` = mean(a), `Mean (diabetes)` = mean(b),
+             `Median (no diabetes)` = median(a), `Median (diabetes)` = median(b),
+             `Cohen d` = (mean(b) - mean(a)) / sp,
+             `Wilcoxon p-value` = wilcox.test(a, b)$p.value,
+             check.names = FALSE)
+}))
+eff <- eff[order(-abs(eff$`Cohen d`)), ]
+eff$`Wilcoxon p-value` <- format.pval(eff$`Wilcoxon p-value`, digits = 2, eps = 1e-10)
+knitr::kable(eff, digits = 2, row.names = FALSE,
+             caption = "Predictors ranked by the strength of the difference between the classes")
+```
+
+```{r by-class-plots, fig.height=7}
+ggplot(long, aes(x = Value, fill = Outcome)) +
+  geom_density(alpha = 0.45) +
+  facet_wrap(~ Variable, scales = "free", ncol = 4) +
+  scale_fill_manual(values = col_y) +
+  labs(title = "Density of each predictor by diabetes status", x = NULL, y = "Density")
+
+ggplot(long, aes(x = Outcome, y = Value, fill = Outcome)) +
+  geom_boxplot(outlier.size = 0.5, show.legend = FALSE) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = col_y) +
+  labs(title = "Boxplots of each predictor by diabetes status", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+**Interpretation.**
+
+* **`Glucose` is by far the best separator** (the largest |d|): the density curves of the two classes are clearly shifted and the boxes barely overlap in the middle. This is also medically expected, since glucose is the diagnostic criterion of diabetes.
+* **`BMI`, `Insulin`, `SkinThickness`, `Age` and `Pregnancies`** show moderate separation: patients with diabetes are on average heavier, older, had more pregnancies and have higher insulin and skinfold values, but the distributions overlap a lot.
+* **`DiabetesPedigreeFunction` and `BloodPressure`** differ least between the classes. Their effects are small but statistically detectable, so they are weak predictors.
+* All predictors differ significantly between the classes (very small p-values), but statistical significance only says the difference exists; |d| shows how large it is.
+
+# Relationships between the predictors
+
+Naive Bayes assumes that the predictors are **conditionally independent given the class**. Strong correlations between predictors violate this assumption, so they must be checked.
+
+```{r cor}
+cp <- cor(diab[predictors], use = "pairwise.complete.obs")
+cs <- cor(diab[predictors], use = "pairwise.complete.obs", method = "spearman")
+
+cd <- as.data.frame(as.table(cs)); names(cd) <- c("V1", "V2", "r")
+ggplot(cd, aes(V1, V2, fill = r)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", r)), size = 3) +
+  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027", limits = c(-1, 1)) +
+  labs(title = "Spearman correlation matrix of the predictors", x = NULL, y = NULL, fill = "r") +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+
+pairs_idx <- which(upper.tri(cp), arr.ind = TRUE)
+pair_tab <- data.frame(Pair = paste(predictors[pairs_idx[, 1]], "and", predictors[pairs_idx[, 2]]),
+                       Pearson = cp[pairs_idx], Spearman = cs[pairs_idx])
+pair_tab <- pair_tab[order(-abs(pair_tab$Spearman)), ]
+knitr::kable(head(pair_tab, 5), digits = 2, row.names = FALSE,
+             caption = "Five most strongly correlated pairs of predictors")
+```
+
+```{r cor-scatter, fig.height=4}
+ggplot(diab, aes(x = Age, y = Pregnancies, colour = Outcome)) +
+  geom_jitter(alpha = 0.5, width = 0.3, height = 0.2) +
+  scale_colour_manual(values = col_y) +
+  labs(title = "Age vs number of pregnancies")
+
+ggplot(diab, aes(x = BMI, y = SkinThickness, colour = Outcome)) +
+  geom_point(alpha = 0.5) +
+  scale_colour_manual(values = col_y) +
+  labs(title = "BMI vs skinfold thickness")
+```
+
+**Interpretation.** Most pairs are only weakly correlated, which is good for Naive Bayes. Three pairs are clearly related:
+
+* **`BMI` and `SkinThickness`** (`r sprintf("%.2f", cs["BMI", "SkinThickness"])`): both measure body fat, so they carry largely the same information.
+* **`Glucose` and `Insulin`** (`r sprintf("%.2f", cs["Glucose", "Insulin"])`): insulin is released in response to glucose.
+* **`Age` and `Pregnancies`** (`r sprintf("%.2f", cs["Age", "Pregnancies"])`): older women have naturally had more pregnancies.
+
+If both variables of such a pair are used, the same information is counted twice and the Naive Bayes probabilities become overconfident. This is a reason to consider keeping only one variable from each pair (for example, `BMI` instead of `SkinThickness`, which also has far fewer missing values).
+
+# Shape of the distributions within the classes
+
+Gaussian Naive Bayes models each predictor in each class by a Normal distribution, so we check how close to Normal the within-class distributions are.
+
+```{r skew-class}
+sk <- do.call(rbind, lapply(predictors, function(v)
+  data.frame(Variable = v,
+             `Skewness (no diabetes)` = skewness(diab[[v]][diab$Outcome == "No diabetes"]),
+             `Skewness (diabetes)`    = skewness(diab[[v]][diab$Outcome == "Diabetes"]),
+             check.names = FALSE)))
+knitr::kable(sk, digits = 2, caption = "Skewness of each predictor within the classes (0 = symmetric)")
+```
+
+```{r qq, fig.height=9}
+ggplot(long, aes(sample = Value)) +
+  stat_qq(size = 0.4, alpha = 0.5) + stat_qq_line(colour = "red") +
+  facet_wrap(~ Variable + Outcome, scales = "free", ncol = 4) +
+  labs(title = "Normal QQ plots within the classes", x = "Theoretical quantiles", y = "Sample quantiles")
+```
+
+**Interpretation.** `Glucose` and `BloodPressure` follow the line well in the central part, so the Normal assumption is reasonable for them (the deviations are in the tails). `BMI` is also fairly close to Normal, but in the diabetes class it has a mild right tail caused by a few very high values. `Pregnancies`, `Age`, `DiabetesPedigreeFunction` and `Insulin` curve away from the line with a heavy right tail and are far from Normal. For these variables a Gaussian Naive Bayes is only an approximation; a log-transformation or a kernel density estimate (`usekernel = TRUE`) would fit better.
+
+# Outliers
+
+```{r outliers}
+box_out <- function(x) {
+  x <- x[!is.na(x)]; q <- quantile(x, c(.25, .75)); i <- q[2] - q[1]
+  lo <- q[1] - 1.5 * i; hi <- q[2] + 1.5 * i
+  c(`Lower fence` = unname(lo), `Upper fence` = unname(hi),
+    `N flagged` = sum(x < lo | x > hi), `% flagged` = 100 * mean(x < lo | x > hi))
+}
+knitr::kable(round(t(sapply(predictors, function(v) box_out(diab[[v]]))), 1),
+             caption = "Outliers by the boxplot (1.5 × IQR) rule")
+```
+
+Outliers appear in all variables except `Glucose`. Their share is largest in `Insulin` (about 6%) and `DiabetesPedigreeFunction` (about 4%), and small elsewhere (2% or less). Most are plausible extreme values (very high insulin, very large BMI), so they are **kept**. Because a Gaussian model uses the mean and SD, which are sensitive to extreme values, outliers can distort the estimated class densities. A few values (such as skinfold = 99 mm) look suspicious, but they cannot be verified.
+
+# Conclusions: choice of variables
+
+1. **Outcome:** `r round(100 * mean(diab$Outcome == "Diabetes"), 1)`% of the patients have diabetes, which is a moderate class imbalance.
+2. **Data quality:** zeros in `Glucose`, `BloodPressure`, `SkinThickness`, `Insulin` and `BMI` are hidden missing values. `Insulin` and `SkinThickness` have so many that using them requires imputation (for example, the median within each class) or leaving them out.
+3. **Strongest predictors:** `Glucose` (clearly the best), then `BMI`, `Age`, `Pregnancies`, and `Insulin`.
+4. **Weakest predictors:** `BloodPressure` and `DiabetesPedigreeFunction` separate the classes only slightly.
+5. **Independence assumption:** `BMI`–`SkinThickness`, `Glucose`–`Insulin` and `Age`–`Pregnancies` are correlated, so some information is duplicated. Keeping one variable from each pair is a good option.
+6. **Normality assumption:** it holds roughly for `Glucose`, `BloodPressure` and (with a mild right tail) `BMI`, and poorly for `Pregnancies`, `Age`, `DiabetesPedigreeFunction` and `Insulin`.
+7. **Limitations:** the analysis is descriptive, so associations do not mean causation. The data contain only women of Pima Indian heritage aged 21 or older, so the results cannot be generalised to other populations.
+
+```{r session-info}
+sessionInfo()
+```
